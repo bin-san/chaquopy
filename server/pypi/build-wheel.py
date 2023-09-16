@@ -35,7 +35,7 @@ STANDARD_LIBS = [
     # Android native APIs (https://developer.android.com/ndk/guides/stable_apis)
     (16, ["libandroid.so", "libc.so", "libdl.so", "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so",
           "libjnigraphics.so", "liblog.so", "libm.so", "libOpenMAXAL.so", "libOpenSLES.so",
-          "libz.so"]),
+          "libz.so", "libandroid-posix-semaphore.so"]),
     (21, ["libmediandk.so"]),
 
     # Chaquopy-provided libraries
