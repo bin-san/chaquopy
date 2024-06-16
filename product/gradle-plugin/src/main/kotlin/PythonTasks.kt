@@ -3,6 +3,7 @@ package com.chaquo.python
 import com.android.build.api.variant.*
 import com.chaquo.python.internal.*
 import com.chaquo.python.internal.Common.assetZip
+import com.chaquo.python.internal.Common.osName
 import org.apache.commons.compress.archivers.zip.*
 import org.gradle.api.*
 import org.gradle.api.artifacts.*
@@ -24,9 +25,7 @@ internal class TaskBuilder(
     val abis: List<String>
 ) {
     val project = plugin.project
-    lateinit var buildPython: List<String>
-
-    lateinit var buildPackagesTask: Provider<OutputDirTask>
+    lateinit var buildPackagesTask: Provider<BuildPackagesTask>
     lateinit var srcTask: Provider<OutputDirTask>
     lateinit var reqsTask: Provider<OutputDirTask>
 
@@ -56,33 +55,77 @@ internal class TaskBuilder(
         }
     }
 
-    fun createBuildPackagesTask(): Provider<OutputDirTask> {
-        val taskName = "extractPythonBuildPackages"
-        try {
-            return project.tasks.named<OutputDirTask>(taskName)
-        } catch (e: UnknownDomainObjectException) {
-            return project.tasks.register<OutputDirTask>(taskName) {
-                // Keep the path short to avoid the the Windows 260-character limit.
-                outputFiles = project.fileTree(plugin.buildSubdir("bp")) {
-                    exclude("**/__pycache__")
-                }
+    fun createBuildPackagesTask() =
+        registerTask("extract", "buildPackages", BuildPackagesTask::class) {
+            var bp: List<String>?
+            try {
+                bp = findBuildPython()
+            } catch (e: BuildPythonException) {
+                bp = null
+                exception = e
+            }
+            inputs.property("buildPython", bp).optional(true)
+
+            // Keep the path short to avoid the the Windows 260-character limit.
+            outputFiles = project.fileTree(plugin.buildSubdir("env", variant)) {
+                exclude("**/__pycache__")
+            }
+
+            if (bp != null) {
                 doLast {
+                    project.exec {
+                        commandLine(bp)
+                        args("-m", "venv", "--without-pip", outputDir)
+                    }
+
                     val zipPath = plugin.extractResource(
                         "gradle/build-packages.zip", plugin.buildSubdir())
                     project.copy {
                         from(project.zipTree(zipPath))
-                        into(outputDir)
+                        into(sitePackages)
                     }
                     project.delete(zipPath)
                 }
             }
+        }
+
+    open class BuildPackagesTask : OutputDirTask() {
+        @get:Internal
+        lateinit var exception: Exception
+
+        @get:Internal
+        val pythonExecutable by lazy {
+            if (::exception.isInitialized) {
+                throw exception
+            } else if (osName() == "windows") {
+                outputDir.resolve("Scripts/python.exe")
+            } else {
+                outputDir.resolve("bin/python")
+            }
+        }
+
+        @get:Internal
+        val sitePackages by lazy {
+            val libPythonDir = if (osName() == "windows") {
+                assertExists(outputDir.resolve("Lib"))
+            } else {
+                val libDir = assertExists(outputDir.resolve("lib"))
+                val pythonDirs = libDir.listFiles()!!.filter {
+                    it.name.startsWith("python")
+                }
+                if (pythonDirs.size != 1) {
+                    throw GradleException(
+                        "found ${pythonDirs.size} python directories in $libDir")
+                }
+                pythonDirs[0]
+            }
+            libPythonDir.resolve("site-packages")
         }
     }
 
     fun createSrcTask() =
         registerTask("merge", "sources") {
             inputs.files(buildPackagesTask)
-            inputs.property("buildPython", python.buildPython).optional(true)
             inputs.property("pyc", python.pyc.src).optional(true)
 
             val dirSets = ArrayList<SourceDirectorySet>()
@@ -149,7 +192,6 @@ internal class TaskBuilder(
             inputs.files(buildPackagesTask)
             inputs.property("abis", abis)
             inputs.property("minApiLevel", variant.minSdkVersion.apiLevel)
-            inputs.property("buildPython", python.buildPython).optional(true)
             inputs.property("pip", python.pip)
             inputs.property("pyc", python.pyc.pip).optional(true)
 
@@ -192,7 +234,6 @@ internal class TaskBuilder(
                         args("--")
                         args("--disable-pip-version-check")
                         if (!customIndexUrl) {
-                            args("--extra-index-url", "https://chaquo.com/pypi-7.0")
                             args("--extra-index-url", "https://chaquo.com/pypi-13.1")
                         }
                         args("--implementation", Common.PYTHON_IMPLEMENTATION)
@@ -261,7 +302,6 @@ internal class TaskBuilder(
         val outputDir = plugin.buildSubdir("proxies", variant)
         val task = registerTask("generate", "proxies") {
             inputs.files(buildPackagesTask, reqsTask, srcTask)
-            inputs.property("buildPython", python.buildPython).optional(true)
             inputs.property("staticProxy", python.staticProxy)
 
             this.outputDir = outputDir
@@ -353,13 +393,17 @@ internal class TaskBuilder(
                 // pre-extracted by AndroidPlatform so they can be loaded with the
                 // standard FileFinder. All other native modules are loaded from a .zip using
                 // AssetFinder.
+                //
+                // If this list changes, search for references to this variable name to
+                // find the tests that need to be updated.
                 val BOOTSTRAP_NATIVE_STDLIB = listOf(
                     "_bz2.so",  // zipfile < importer
                     "_ctypes.so",  // java.primitive and importer
                     "_datetime.so",  // calendar < importer (see test_datetime)
                     "_lzma.so",  // zipfile < importer
                     "_random.so",  // random < tempfile < zipimport
-                    "_sha512.so",  // random < tempfile < zipimport
+                    "_sha2.so",  // random < tempfile < zipimport (Python >= 3.12)
+                    "_sha512.so",  // random < tempfile < zipimport (Python <= 3.11)
                     "_struct.so",  // zipfile < importer
                     "binascii.so",  // zipfile < importer
                     "math.so",  // datetime < calendar < importer
@@ -542,16 +586,9 @@ internal class TaskBuilder(
     }
 
     fun execBuildPython(configure: ExecSpec.() -> Unit) {
-        if (! ::buildPython.isInitialized) {
-            buildPython = findBuildPython()
-        }
-
         try {
             project.exec {
-                environment("PYTHONPATH", buildPackagesTask.get().outputDir)
-                commandLine(buildPython)
-                args("-S")  // Avoid interference from site-packages. This is not inherited by
-                            // subprocesses, so it's used again in pip_install.py.
+                executable(buildPackagesTask.get().pythonExecutable)
                 configure()
             }
         } catch (e: ExecException) {
@@ -579,7 +616,7 @@ internal class TaskBuilder(
             } else {
                 val version = python.version!!
                 for (suffix in listOf(version, version.split(".")[0])) {
-                    if (System.getProperty("os.name").startsWith("Windows")) {
+                    if (osName() == "windows") {
                         // See PEP 397. After running the official Windows installer
                         // with default settings, this will be the only Python thing on
                         // the PATH.
@@ -729,4 +766,12 @@ fun makeZip(tree: FileTree, outFile: File) {
             }
         })
     }
+}
+
+
+fun assertExists(f: File) : File {
+    if (!f.exists()) {
+        throw GradleException("$f does not exist")
+    }
+    return f
 }

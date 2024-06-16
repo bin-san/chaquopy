@@ -23,21 +23,33 @@ afterEvaluate {
 
 android {
     namespace = "com.chaquo.python.demo"
-    compileSdk = 33
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "com.chaquo.python.demo3"
         minSdk = 21
-        targetSdk = 33
+        targetSdk = 34
 
-        versionName = System.getProperty("chaquopyVersion")  // Set in the root project
+        val plugins = buildscript.configurations.getByName("classpath")
+             .resolvedConfiguration.resolvedArtifacts.map {
+                 it.moduleVersion.id
+            }.filter {
+                it.group == "com.chaquo.python" && it.name == "gradle"
+            }
+        if (plugins.size != 1) {
+            throw GradleException("found ${plugins.size} Chaquopy plugins")
+        }
+        versionName = plugins[0].version
+
         val verParsed = versionName!!.split(".").map { it.toInt() }
         versionCode = verParsed[0] * 1000000 +
                       verParsed[1] * 1000 +
                       verParsed[2] * 10
 
         ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            abiFilters += listOf(
+                "arm64-v8a", "armeabi-v7a", "x86", "x86_64"
+            )
         }
 
         // Remove other languages imported from Android support libraries.
@@ -91,8 +103,10 @@ chaquopy {
 
         // Python unit tests
         pip {
-            // In newer versions, importing murmurhash automatically imports and
-            // extracts murmurhash/mrmr.so, which would complicate the tests.
+            // We use an old version of murmurhash (built from the Chaquopy branch
+            // `murmurhash-0`), because in newer versions, importing murmurhash
+            // automatically imports and extracts murmurhash/mrmr.so, which would
+            // complicate the tests.
             install("murmurhash==0.28.0")  // Requires chaquopy-libcxx
 
             // Because we set pyc.src to false, we must test extractPackages via pip.
@@ -134,6 +148,5 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:1.1.3")
     implementation("androidx.lifecycle:lifecycle-extensions:2.1.0")
     implementation("androidx.preference:preference:1.1.1")
-    implementation("junit:junit:4.12")
-    implementation("org.hamcrest:hamcrest-library:2.2")
+    implementation("junit:junit:4.13.2")
 }

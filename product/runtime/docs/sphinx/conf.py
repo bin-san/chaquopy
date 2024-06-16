@@ -22,6 +22,7 @@
 
 from datetime import datetime
 import re
+import sys
 
 
 # -- General configuration ------------------------------------------------
@@ -61,9 +62,9 @@ copyright = u'{} {}'.format(datetime.now().year, author)
 #
 # The full version, including alpha/beta/rc tags.
 #
-# Chaquopy: this is no longer auto-generated from VERSION.txt, because that made it awkward to
-# release documentation updates between versions.
-release = "15.0.0"
+# Chaquopy: this is no longer auto-generated from VERSION.txt, because that made it
+# awkward to release documentation updates between versions.
+release = "15.0.1"
 # The short X.Y version.
 version = release.rpartition(".")[0]
 
@@ -186,8 +187,12 @@ texinfo_documents = [
 
 # -- Options for Intersphinx ----------------------------------------------
 
-intersphinx_mapping = {'https://docs.python.org/3': None}
-
+intersphinx_mapping = {
+    'python': (
+        f'https://docs.python.org/{".".join(map(str, sys.version_info[:2]))}',
+        None,
+    )
+}
 
 # -- Local extensions -----------------------------------------------------
 

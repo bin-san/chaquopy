@@ -13,15 +13,16 @@ public class Common {
     // This should match api_level in target/build-common.sh.
     public static final int MIN_SDK_VERSION = 21;
 
-    public static final int COMPILE_SDK_VERSION = 30;
+    public static final int COMPILE_SDK_VERSION = 34;
 
     public static final Map<String, String> PYTHON_VERSIONS = new LinkedHashMap<>();
     static {
         // Version, build number
-        PYTHON_VERSIONS.put("3.8.16", "0");
-        PYTHON_VERSIONS.put("3.9.13", "1");
-        PYTHON_VERSIONS.put("3.10.6", "1");
-        PYTHON_VERSIONS.put("3.11.0", "2");
+        PYTHON_VERSIONS.put("3.8.18", "0");
+        PYTHON_VERSIONS.put("3.9.18", "0");
+        PYTHON_VERSIONS.put("3.10.13", "0");
+        PYTHON_VERSIONS.put("3.11.6", "0");
+        PYTHON_VERSIONS.put("3.12.1", "0");
     }
 
     public static List<String> PYTHON_VERSIONS_SHORT = new ArrayList<>();
@@ -38,8 +39,22 @@ public class Common {
     // Wheel tags (PEP 425).
     public static final String PYTHON_IMPLEMENTATION = "cp";  // CPython
 
-    public static final List<String> ABIS = Arrays.asList
-        ("armeabi-v7a", "arm64-v8a", "x86", "x86_64");
+    public static List<String> supportedAbis(String pythonVersion) {
+        if (!PYTHON_VERSIONS_SHORT.contains(pythonVersion)) {
+            throw new IllegalArgumentException(
+                "Unknown Python version: '" + pythonVersion + "'");
+        }
+
+        List<String> result = new ArrayList<>();
+        result.add("arm64-v8a");
+        result.add("x86_64");
+        if (Arrays.asList("3.8", "3.9", "3.10", "3.11").contains(pythonVersion)) {
+            result.add("armeabi-v7a");
+            result.add("x86");
+        }
+        result.sort(null);  // For testing error messages
+        return result;
+    }
 
     // Subdirectory name to use within assets, getFilesDir() and getCacheDir()
     public static final String ASSET_DIR = "chaquopy";
@@ -81,6 +96,17 @@ public class Common {
     public static final String ASSET_BUILD_JSON = "build.json";
     public static final String ASSET_CACERT = "cacert.pem";
 
+    public static String osName() {
+        String property = System.getProperty("os.name");
+        String[] knownNames = new String[] {"linux", "mac", "windows"};
+        for (String name : knownNames) {
+            if (property.toLowerCase(Locale.ENGLISH).startsWith(name)) {
+                return name;
+            }
+        }
+        throw new RuntimeException("unknown os.name: " + property);
+    }
+
     public static String findExecutable(String name) throws FileNotFoundException {
         File file = new File(name);
         if (file.isAbsolute()) {
@@ -95,6 +121,10 @@ public class Common {
         // /usr/local/bin instead. This directory may also appear to be on the default
         // PATH, but this is because it's listed in /etc/paths, which only affects
         // shells, but not other apps like Android Studio and its Gradle subprocesses.
+        //
+        // As of Gradle 6.9, this appears to be unnecessary (#821). So once the
+        // `product` project is using a newer version than that, we can remove this
+        // method and let Gradle find executables itself.
         List<String> path = new ArrayList<>();
         String osName = System.getProperty("os.name").toLowerCase();
         if (osName.startsWith("mac")) {

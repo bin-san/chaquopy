@@ -1,11 +1,25 @@
+# This recipe requires Chaquopy 8.0.1 or later, because those versions contain a
+# workaround for multiprocessing and joblib which used to be in this recipe's patch.
+{% if PY_VER == "3.8" %}
+    {% set numpy_version = "1.19.5" %}
+    {% set scipy_version = "1.4.1" %}
+{% elif PY_VER == "3.9" %}
+    {% set numpy_version = "1.23.3" %}
+    {% set scipy_version = "1.6.3" %}
+{% elif PY_VER == "3.10" %}
+    {% set numpy_version = "1.23.3" %}
+    {% set scipy_version = "1.8.1" %}
+{% endif %}
+
 package:
   name: scikit-learn
-  version: "0.24.1"
+  version: "1.3.2"
+
+build:
+  number: 1
 
 requirements:
-  build:
-    - cython 0.29.14
   host:
     - chaquopy-openblas 0.2.20
-    - numpy 1.17.4
-    - scipy 1.4.1
+    - numpy {{ numpy_version }}
+    - scipy {{ scipy_version }}

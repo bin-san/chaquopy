@@ -2,13 +2,14 @@ import _imp
 from calendar import timegm
 from contextlib import contextmanager, nullcontext
 import ctypes
-import imp
 from importlib import _bootstrap, _bootstrap_external, machinery, util
 from inspect import getmodulename
 import io
 import os
-from os.path import basename, dirname, exists, join, normpath, realpath, relpath, split, splitext
-import pathlib
+from os.path import (
+    basename, dirname, exists, isfile, join, normpath, realpath, relpath, split, splitext
+)
+from pathlib import Path
 from pkgutil import get_importer
 import re
 from shutil import copyfileobj, rmtree
@@ -28,12 +29,16 @@ from com.chaquo.python.android import AndroidPlatform
 from com.chaquo.python.internal import Common
 
 
+import_triggers = {}
+
+
 def initialize(context, build_json, app_path):
     global nativeLibraryDir
     nativeLibraryDir = context.getApplicationInfo().nativeLibraryDir
     initialize_importlib(context, build_json, app_path)
     initialize_ctypes()
-    initialize_imp()
+    if sys.version_info < (3, 12):
+        initialize_imp()
 
 
 def initialize_importlib(context, build_json, app_path):
@@ -79,6 +84,12 @@ def initialize_importlib(context, build_json, app_path):
         # get_importer returns.
         site.addsitedir(finder.extract_root)
 
+    if sys.version_info[:2] == (3, 9):
+        from importlib import _common
+        global fallback_resources_original
+        fallback_resources_original = _common.fallback_resources
+        _common.fallback_resources = fallback_resources_39
+
     global spec_from_file_location_original
     spec_from_file_location_original = util.spec_from_file_location
     util.spec_from_file_location = spec_from_file_location_override
@@ -89,6 +100,14 @@ def initialize_importlib(context, build_json, app_path):
     global extension_create_module_original
     extension_create_module_original = machinery.ExtensionFileLoader.create_module
     machinery.ExtensionFileLoader.create_module = extension_create_module_override
+
+
+# Python 3.9 only supports importlib.resources.files for the standard importers.
+def fallback_resources_39(spec):
+    if isinstance(spec.loader, AssetLoader):
+        return spec.loader.get_resource_reader(spec.name).files()
+    else:
+        return fallback_resources_original(spec)
 
 
 def spec_from_file_location_override(name, location=None, *args, loader=None, **kwargs):
@@ -175,6 +194,8 @@ def initialize_ctypes():
 
 
 def initialize_imp():
+    import imp
+
     # The standard implementations of imp.find_module and imp.load_module do not use the PEP
     # 302 import system. They are therefore only capable of loading from directory trees and
     # built-in modules, and will ignore both sys.path_hooks and sys.meta_path. To accommodate
@@ -187,6 +208,8 @@ def initialize_imp():
 
 
 def find_module_override(base_name, path=None):
+    import imp
+
     # When calling find_module_original, we can't just replace None with sys.path, because None
     # will also search built-in modules.
     path_original = path
@@ -273,6 +296,15 @@ def initialize_pkg_resources():
             super().__init__(module)
             self.finder = self.loader.finder
 
+        # pkg_resources has a mechanism for extracting resources to temporary files, but
+        # we don't currently support it. So this will only work for files which are
+        # already extracted.
+        def get_resource_filename(self, manager, resource_name):
+            path = self._fn(self.module_path, resource_name)
+            if not self._has(path):
+                raise FileNotFoundError(path)
+            return path
+
         def _has(self, path):
             return self.finder.exists(self.finder.zip_path(path))
 
@@ -324,7 +356,7 @@ class ChaquopyPathFinder(machinery.PathFinder):
         pattern = fr"^{name}(-.*)?\.(dist|egg)-info$"
 
         for entry in context.path:
-            path_cls = AssetPath if entry.startswith(ASSET_PREFIX + "/") else pathlib.Path
+            path_cls = AssetPath if entry.startswith(ASSET_PREFIX + "/") else Path
             entry_path = path_cls(entry)
             try:
                 if entry_path.is_dir():
@@ -335,30 +367,60 @@ class ChaquopyPathFinder(machinery.PathFinder):
                 pass  # Inaccessible path entries should be ignored.
 
 
-class AssetPath(pathlib.PosixPath):
-
-    # Derived path objects (e.g. from `joinpath` or `/`) are created using object.__new__,
-    # so we can't initialize them by overriding __new__ or __init__.
-    @property
-    def finder(self):
-        root_dir = str(self)
+# This does not inherit from PosixPath, because that would cause
+# importlib.resources.as_file to return it unchanged, rather than creating a temporary
+# file as it should. However, once our minimum version is Python 3.9, we can inherit
+# from importlib.resources.abc.Traversable, and remove our implementations of read_text,
+# read_bytes, and __truediv__.
+class AssetPath:
+    def __init__(self, path):
+        root_dir = path
         while dirname(root_dir) != ASSET_PREFIX:
             root_dir = dirname(root_dir)
-            assert root_dir, str(self)
-        return get_importer(root_dir)
+            assert root_dir, path
+        self.finder = get_importer(root_dir)
+        self.zip_path = self.finder.zip_path(path)
+
+    def __str__(self):
+        return join(self.finder.extract_root, self.zip_path)
+
+    def __repr__(self):
+        return f"{type(self).__name__}({str(self)!r})"
+
+    def __eq__(self, other):
+        return (type(self) is type(other)) and (str(self) == str(other))
+
+    def __hash(self):
+        return hash(str(self))
 
     @property
-    def zip_path(self):
-        return self.finder.zip_path(str(self))
+    def name(self):
+        return basename(str(self))
+
+    def exists(self):
+        return self.finder.exists(self.zip_path)
 
     def is_dir(self):
         return self.finder.isdir(self.zip_path)
 
+    def is_file(self):
+        return self.exists() and not self.is_dir()
+
     def iterdir(self):
         for name in self.finder.listdir(self.zip_path):
-            yield AssetPath(join(str(self),  name))
+            yield self.joinpath(name)
 
-    def open(self, mode="r", buffering=-1, **kwargs):
+    def joinpath(self, *segments):
+        child_path = join(str(self), *segments)
+        if isfile(child_path):
+            return Path(child_path)  # For data files created by extract_dir.
+        else:
+            return type(self)(child_path)
+
+    def __truediv__(self, child):
+        return self.joinpath(child)
+
+    def open(self, mode="r", buffering="ignored", **kwargs):
         if "r" in mode:
             bio = io.BytesIO(self.finder.get_data(self.zip_path))
             if mode == "r":
@@ -367,9 +429,16 @@ class AssetPath(pathlib.PosixPath):
                 return bio
         raise ValueError(f"unsupported mode: {mode!r}")
 
+    def read_bytes(self):
+        with self.open('rb') as strm:
+            return strm.read()
+
+    def read_text(self, encoding=None):
+        with self.open(encoding=encoding) as strm:
+            return strm.read()
+
 
 class AssetFinder:
-
     def __init__(self, context, build_json, path):
         if not path.startswith(ASSET_PREFIX + "/"):
             raise ImportError(f"not an asset path: '{path}'")
@@ -519,6 +588,8 @@ class AssetFinder:
 
     def get_data(self, zip_path):
         for zf in self.zip_files:
+            if zf.isdir(zip_path):
+                raise IsADirectoryError(zip_path)
             try:
                 return zf.read(zip_path)
             except KeyError:
@@ -535,7 +606,8 @@ class AssetFinder:
         return path[len(self.extract_root) + 1:]
 
 
-# To create a concrete loader class, inherit this class followed by a FileLoader subclass.
+# To create a concrete loader class, inherit this class followed by a FileLoader
+# subclass, in that order.
 class AssetLoader:
     def __init__(self, finder, fullname, zip_info):
         self.finder = finder
@@ -545,7 +617,8 @@ class AssetLoader:
     def __repr__(self):
         return f"{type(self).__name__}({self.name!r}, {self.path!r})"
 
-    # Override to disable the fullname check. This is necessary for module renaming via imp.
+    # Override to disable the fullname check. This is only necessary for module renaming
+    # via `imp`, so it can be removed one our minimum version is Python 3.12.
     def get_filename(self, fullname):
         return self.path
 
@@ -561,31 +634,64 @@ class AssetLoader:
         super().exec_module(mod)
         exec_module_trigger(mod)
 
-    def get_resource_reader(self, mod_name):
-        return self if self.is_package(mod_name) else None
+    # The importlib.resources.abc documentation says "If the module specified by
+    # fullname is not a package, this method should return None", but that's no longer
+    # true as of Python 3.12, because importlib.resources.files can accept a module as
+    # well as a package.
+    def get_resource_reader(self, fullname):
+        assert fullname == self.name, (fullname, self.name)
+        return AssetResourceReader(self.finder, dirname(self.path))
 
-    def open_resource(self, name):
-        return io.BytesIO(self.get_data(self.res_abs_path(name)))
 
-    def resource_path(self, name):
-        path = self.res_abs_path(name)
-        if exists(path):
-            # For __pycache__ directories created by SourceAssetLoader, and data files created
-            # by extract_dir.
-            return path
+class AssetResourceReader:
+    def __init__(self, finder, path):
+        assert finder.isdir(finder.zip_path(path)), path
+        self.asset_path = AssetPath(path)
+
+    def __repr__(self):
+        return f"<{type(self).__name__} {str(self.asset_path)!r}>"
+
+    # Implementation of importlib.resources.abc.TraversableResources
+    def files(self):
+        return self.asset_path
+
+    # The remaining methods are an implementation of
+    # importlib.resources.abc.ResourceReader. In Python 3.11, the old
+    # importlib.resources API is entirely implemented in terms of the new API, so once
+    # that's our minimum version, we can remove these methods and inherit them from
+    # TraversableResources instead.
+
+    def open_resource(self, resource):
+        return self.files().joinpath(resource).open('rb')
+
+    def resource_path(self, resource):
+        path = self.files().joinpath(resource)
+        if isinstance(path, Path):
+            return path  # For data files created by extract_dir.
         else:
             # importlib.resources.path will call open_resource and create a temporary file.
             raise FileNotFoundError()
 
+    # The documentation says this should raise FileNotFoundError if the name doesn't
+    # exist, but that would cause inconsistent behavior of the public is_resource
+    # function, which forwards directly to this method before Python 3.11, but uses
+    # files().iterdir() after Python 3.11.
     def is_resource(self, name):
-        zip_path = self.finder.zip_path(self.res_abs_path(name))
-        return self.finder.exists(zip_path) and not self.finder.isdir(zip_path)
+        return self.files().joinpath(name).is_file()
 
     def contents(self):
-        return self.finder.listdir(self.finder.zip_path(dirname(self.path)))
+        return (item.name for item in self.files().iterdir())
 
-    def res_abs_path(self, name):
-        return join(dirname(self.path), name)
+
+def add_import_trigger(name, trigger):
+    """Register a callable to be called immediately after the module of the given name
+    is imported. If the module has already been imported, the trigger is called
+    immediately."""
+
+    if name in sys.modules:
+        trigger()
+    else:
+        import_triggers[name] = trigger
 
 
 def exec_module_trigger(mod):
@@ -594,8 +700,10 @@ def exec_module_trigger(mod):
         initialize_pkg_resources()
     elif name == "numpy":
         java.chaquopy.numpy = mod  # See conversion.pxi.
-    elif name == "ssl":
-        java.android.initialize_ssl()
+    else:
+        trigger = import_triggers.pop(name, None)
+        if trigger:
+            trigger()
 
 
 # The SourceFileLoader base class will automatically create and use _pycache__ directories.
